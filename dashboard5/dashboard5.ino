@@ -28,8 +28,7 @@ const GFXfont* font_small = &Roboto_Regular12pt7b;    // 12pt - Labels, date, ti
 //const GFXfont* font_small = nullptr;
 
 #define BAT_ADC_PIN 34   // GPIO34 (A2)
-#define ADC_MAX 4095     // 12-bit ADC
-#define ADC_REF_VOLTAGE 1100  // mV (internal reference voltage, typically 1100mV)
+#define BAT_ADC_SAMPLES 16  // number of samples averaged per reading, to smooth out ADC noise
 
 // NTP Server settings
 const char* NTP_SERVER = "pool.ntp.org";
@@ -119,35 +118,62 @@ void connectToWiFi() {
   }
 }
 
-int getBatteryV2() {
-  int adcValue = analogRead(BAT_ADC_PIN);
-  int mv = analogReadMilliVolts(BAT_ADC_PIN); // if supported by your ESP32 core
+// Single-cell LiPo discharge curve (voltage -> percentage). LiPo voltage sags
+// non-linearly - it stays fairly flat through most of the usable capacity and
+// then drops off sharply near empty, so a straight 3.0-4.2V line under- or
+// over-reports charge depending on where on the curve the battery sits.
+// Values between points are linearly interpolated.
+struct BatteryCurvePoint { float voltage; float percent; };
+const BatteryCurvePoint BATTERY_CURVE[] = {
+  {4.20, 100.0}, {4.15, 95.0}, {4.11, 90.0}, {4.08, 85.0}, {4.02, 80.0},
+  {3.98, 75.0},  {3.95, 70.0}, {3.91, 65.0}, {3.87, 60.0}, {3.85, 55.0},
+  {3.84, 50.0},  {3.82, 45.0}, {3.80, 40.0}, {3.79, 35.0}, {3.77, 30.0},
+  {3.75, 25.0},  {3.73, 20.0}, {3.71, 15.0}, {3.69, 10.0}, {3.61, 5.0},
+  {3.27, 0.0}
+};
+const int BATTERY_CURVE_POINTS = sizeof(BATTERY_CURVE) / sizeof(BATTERY_CURVE[0]);
+
+float getBatteryPercentage(float voltage) {
+  if (voltage >= BATTERY_CURVE[0].voltage) return 100.0;
+  if (voltage <= BATTERY_CURVE[BATTERY_CURVE_POINTS - 1].voltage) return 0.0;
+
+  for (int i = 0; i < BATTERY_CURVE_POINTS - 1; i++) {
+    float vHigh = BATTERY_CURVE[i].voltage;
+    float vLow = BATTERY_CURVE[i + 1].voltage;
+    if (voltage <= vHigh && voltage >= vLow) {
+      float pHigh = BATTERY_CURVE[i].percent;
+      float pLow = BATTERY_CURVE[i + 1].percent;
+      return pLow + (voltage - vLow) / (vHigh - vLow) * (pHigh - pLow);
+    }
+  }
+  return 0.0; // unreachable
+}
+
+// Reads the battery voltage - averaged over several samples to smooth out
+// ADC noise - and converts it to a percentage using the LiPo curve above.
+// Call this before any WiFi activity: WiFi's current draw can sag the
+// reading if the battery/regulator has any real internal resistance.
+int readBatteryPercent() {
+  long mvSum = 0;
+  for (int i = 0; i < BAT_ADC_SAMPLES; i++) {
+    mvSum += analogReadMilliVolts(BAT_ADC_PIN);
+    delay(2);
+  }
+  int mv = mvSum / BAT_ADC_SAMPLES;
 
   // FireBeetle 2 ESP32-E has a 1/2 voltage divider, so multiply by 2
   float batteryVoltage = mv * 2 / 1000.0; // in Volts
+  float percent = getBatteryPercentage(batteryVoltage);
 
-  Serial.print("ADC Value: ");
-  Serial.println(adcValue);
   Serial.print("Measured Voltage: ");
-  Serial.print(batteryVoltage);
+  Serial.print(batteryVoltage, 2);
   Serial.println(" V");
-
-  // Compute battery percentage
-  float batteryPercent = getBatteryPercentage(batteryVoltage);
   Serial.print("Battery: ");
-  Serial.print(batteryPercent, 1);
+  Serial.print(percent, 1);
   Serial.println("%");
-
   Serial.println("-----------------");
 
-  return (int) batteryPercent;
-}
-
-float getBatteryPercentage(float voltage) {
-  if (voltage >= 4.2) return 100.0;
-  if (voltage <= 3.0) return 0.0;
-  // Linear approximation (you can refine this with a lookup table)
-  return (voltage - 3.0) / (4.2 - 3.0) * 100.0;
+  return (int) round(percent);
 }
 
 void fetchAllSensorStates() {
@@ -717,6 +743,12 @@ void setup() {
 
 void loop() {
   Serial.println("--- Starting new cycle ---");
+
+  // Measure battery before any WiFi activity, so the reading isn't skewed
+  // by voltage sag from the radio's current draw.
+  batteryPercent = readBatteryPercent();
+  Serial.printf("Battery percentage: %d\n", batteryPercent);
+
   connectToWiFi(); // Connect to WiFi
 
   // Sync time with NTP server (only if WiFi is connected)
@@ -725,10 +757,6 @@ void loop() {
   }
 
   fetchAllSensorStates();
-
-  batteryPercent = getBatteryV2();
-  //batteryPercent = batteryPercentage(voltage);
-  Serial.printf("Battery percentage: %d\n", batteryPercent);
 
   displaySensorData();
 
