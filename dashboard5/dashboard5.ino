@@ -94,6 +94,27 @@ int totalHeatingMinutes = 0;
 
 int batteryPercent = 0;
 
+// --- Sleep / refresh cadence configuration ---
+// The ESP32 wakes every CLOCK_TICK_SECONDS to update just the clock via a
+// fast partial refresh (light sleep, so the display's partial-update state
+// survives between ticks). Every DAY_FULL_REFRESH_TICKS (day) or
+// NIGHT_FULL_REFRESH_TICKS (night) ticks, it instead reconnects WiFi, pulls
+// fresh sensor/weather data, and does a full-window refresh.
+#define CLOCK_TICK_SECONDS 60
+#define DAY_FULL_REFRESH_TICKS 5     // 5 * 60s = 5 minutes
+#define NIGHT_FULL_REFRESH_TICKS 10  // 10 * 60s = 10 minutes
+#define NIGHT_START_HOUR 1
+#define NIGHT_END_HOUR 5
+
+// Bounding box of the clock (time + date) within the header, used for
+// partial-window refreshes so the rest of the dashboard stays untouched.
+const int16_t CLOCK_X = 280;
+const int16_t CLOCK_Y = 0;
+const int16_t CLOCK_W = 296;
+const int16_t CLOCK_H = 100;
+
+int ticksSinceFullRefresh = 999; // force a full refresh on first boot
+
 // Function to connect to Wi-Fi
 void connectToWiFi() {
   Serial.print("Connecting to WiFi: ");
@@ -374,6 +395,17 @@ String getCurrentDate() {
   return String(dateStr);
 }
 
+// True during the reduced-frequency overnight window. Defaults to false
+// (day cadence) if NTP time isn't known yet, e.g. on first boot.
+bool inNightWindow() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    return false;
+  }
+  int hour = timeinfo.tm_hour;
+  return (hour >= NIGHT_START_HOUR && hour < NIGHT_END_HOUR);
+}
+
 // Helper function to get weather icon based on condition string
 const unsigned char* getWeatherIcon(String condition) {
   // Convert condition to lowercase for comparison
@@ -464,6 +496,19 @@ void setFont(const GFXfont* font, int defaultSize = 1) {
   }
 }
 
+// Draws the current time + date in the header's middle section. Shared by
+// the full dashboard draw and the clock-only partial refresh tick, so both
+// paths always draw the clock at the exact same position.
+void drawClock() {
+  display.setFont(font_xxlarge);  // XXLarge (60pt) for time
+  display.setCursor(300, 70);  // Adjusted Y position for custom font baseline
+  display.print(getCurrentTime());
+
+  display.setFont(font_small);  // Small (16pt) for date
+  display.setCursor(300, 90);  // Adjusted Y position
+  display.print(getCurrentDate());
+}
+
 void drawHeader() {
   // Layout constants
   const int HEADER_HEIGHT = 100;
@@ -473,10 +518,6 @@ void drawHeader() {
   String sunrise = convertISOToLocalHHMM(getSensorValue("sensor.sun_next_rising"));
   String outdoorTemp = getSensorValue("sensor.pilisszentivan_temperature");
   String weatherCondition = getSensorValue("sensor.pilisszentivan_condition");
-
-  // Get current time and date from NTP
-  String currentTime = getCurrentTime();
-  String currentDate = getCurrentDate();
 
   // Left side: Sunset and Sunrise icons + times (x=10, y=10)
   // Draw sunset icon at (10, 10) size 40x40
@@ -492,13 +533,7 @@ void drawHeader() {
   display.print(sunrise);
 
   // Middle: Time and Date (centered around x=300)
-  display.setFont(font_xxlarge);  // XXLarge (60pt) for time
-  display.setCursor(300, 70);  // Adjusted Y position for custom font baseline
-  display.print(currentTime);
-
-  display.setFont(font_small);  // Small (16pt) for date
-  display.setCursor(300, 90);  // Adjusted Y position
-  display.print(currentDate);
+  drawClock();
 
   // Right side: Weather icon and outdoor temperature
   // Draw weather icon at (570, 10) size 90x90 (actual icon size)
@@ -703,12 +738,9 @@ void drawFooter() {
   display.print("m");
 }
 
-void displaySensorData() {
-  display.init(115200); // Initialize display with a baud rate
-  display.setRotation(0); // Set to horizontal landscape (0 or 2 for landscape)
+void drawFullDashboard() {
   display.setFullWindow(); // Set full window for full screen updates
 
-  // Clear display
   display.firstPage();
   do {
     display.fillScreen(GxEPD_WHITE);
@@ -721,35 +753,38 @@ void displaySensorData() {
     drawFooter();
 
   } while (display.nextPage());
+  display.powerOff(); // drop driving voltage between updates, don't fade the panel
 
-  Serial.println("Display updated successfully");
+  Serial.println("Full dashboard refresh complete");
 }
 
-void setup() {
-  Serial.begin(115200);
-  Serial.println("\nESP32 E-Ink Home Assistant Sensor Display");
+// Fast partial refresh of just the clock area - used for the once-a-minute
+// tick between full dashboard refreshes, so bumping the displayed minute
+// doesn't need WiFi or a full, more visible screen flash.
+void drawClockPartial() {
+  display.setPartialWindow(CLOCK_X, CLOCK_Y, CLOCK_W, CLOCK_H);
 
-  analogReadResolution(12);
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    display.setTextColor(GxEPD_BLACK);
+    drawClock();
+  } while (display.nextPage());
+  display.powerOff(); // drop driving voltage between updates, don't fade the panel
 
-
-  // Check if we woke up from deep sleep
-  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
-  if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
-    Serial.println("Woke up from deep sleep (timer).");
-  } else {
-    Serial.println("First boot or external reset.");
-  }
+  Serial.println("Clock partial refresh complete");
 }
 
-void loop() {
-  Serial.println("--- Starting new cycle ---");
-
+// Reconnects WiFi, syncs time, pulls fresh sensor/weather data, and does a
+// full dashboard redraw. This is the expensive path - only run periodically
+// (see ticksSinceFullRefresh in loop()), not on every clock tick.
+void doFullRefreshCycle() {
   // Measure battery before any WiFi activity, so the reading isn't skewed
   // by voltage sag from the radio's current draw.
   batteryPercent = readBatteryPercent();
   Serial.printf("Battery percentage: %d\n", batteryPercent);
 
-  connectToWiFi(); // Connect to WiFi
+  connectToWiFi();
 
   // Sync time with NTP server (only if WiFi is connected)
   if (WiFi.status() == WL_CONNECTED) {
@@ -758,30 +793,43 @@ void loop() {
 
   fetchAllSensorStates();
 
-  displaySensorData();
+  drawFullDashboard();
 
-  // Put the e-paper controller to sleep so it doesn't keep drawing power
-  // (and the panel doesn't fade) while the ESP32 is in deep sleep.
-  display.hibernate();
+  // Done with WiFi until the next full-refresh cycle - no need to keep the
+  // radio on through the clock-only ticks in between.
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+}
 
-  // Check the current hour for night mode
-  struct tm timeinfo;
-  if (getLocalTime(&timeinfo)) {
-    int current_hour = timeinfo.tm_hour;
-    if (current_hour >= 1 && current_hour < 5) {
-      // Night mode: update every 5 minutes
-      Serial.println("Entering deep sleep for 300 seconds (night mode)...");
-      esp_sleep_enable_timer_wakeup(300 * 1000000); // 300 seconds in microseconds
-    } else {
-      // Day mode: update every 60 seconds
-      Serial.println("Entering deep sleep for 60 seconds...");
-      esp_sleep_enable_timer_wakeup(60 * 1000000); // 60 seconds in microseconds
-    }
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\nESP32 E-Ink Home Assistant Sensor Display");
+
+  analogReadResolution(12);
+
+  // The display is only initialized once here - unlike deep sleep, light
+  // sleep (used in loop() below) keeps RAM intact, so there's no need to
+  // (and no benefit to) re-init the panel on every tick.
+  display.init(115200);
+  display.setRotation(0); // Set to horizontal landscape (0 or 2 for landscape)
+}
+
+void loop() {
+  bool isNight = inNightWindow();
+  int fullRefreshInterval = isNight ? NIGHT_FULL_REFRESH_TICKS : DAY_FULL_REFRESH_TICKS;
+
+  if (ticksSinceFullRefresh >= fullRefreshInterval) {
+    Serial.println("--- Full refresh cycle ---");
+    doFullRefreshCycle();
+    ticksSinceFullRefresh = 0;
   } else {
-    // Fallback to 60 seconds if time is not available
-    Serial.println("Time not available, entering deep sleep for 60 seconds...");
-    esp_sleep_enable_timer_wakeup(60 * 1000000); // 60 seconds in microseconds
+    Serial.println("--- Clock tick ---");
+    drawClockPartial();
+    ticksSinceFullRefresh++;
   }
-  
-  esp_deep_sleep_start();
+
+  Serial.printf("Light sleep for %d seconds...\n", CLOCK_TICK_SECONDS);
+  Serial.flush();
+  esp_sleep_enable_timer_wakeup((uint64_t)CLOCK_TICK_SECONDS * 1000000ULL);
+  esp_light_sleep_start();
 }
