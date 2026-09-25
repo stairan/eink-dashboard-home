@@ -519,18 +519,18 @@ void drawHeader() {
   String outdoorTemp = getSensorValue("sensor.pilisszentivan_temperature");
   String weatherCondition = getSensorValue("sensor.pilisszentivan_condition");
 
-  // Left side: Sunset and Sunrise icons + times (x=10, y=10)
-  // Draw sunset icon at (10, 10) size 40x40
-  display.drawBitmap(10, 10, epd_bitmap_sunset, 40, 40, GxEPD_BLACK);
+  // Left side: Sunrise and Sunset icons + times (x=10, y=10)
+  // Draw sunrise icon at (10, 10) size 40x40
+  display.drawBitmap(10, 10, epd_bitmap_sunrise, 40, 40, GxEPD_BLACK);
   display.setFont(font_medium);
   display.setCursor(60, 35);
-  display.print(sunset);
+  display.print(sunrise);
 
-  // Draw sunrise icon at (10, 55) size 40x40
-  display.drawBitmap(10, 55, epd_bitmap_sunrise, 40, 40, GxEPD_BLACK);
+  // Draw sunset icon at (10, 55) size 40x40
+  display.drawBitmap(10, 55, epd_bitmap_sunset, 40, 40, GxEPD_BLACK);
   display.setFont(font_medium);
   display.setCursor(60, 80);
-  display.print(sunrise);
+  display.print(sunset);
 
   // Middle: Time and Date (centered around x=300)
   drawClock();
