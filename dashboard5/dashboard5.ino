@@ -120,14 +120,28 @@ void connectToWiFi() {
   Serial.print("Connecting to WiFi: ");
   Serial.println(WIFI_SSID);
 
+  WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  int retries = 0;
-  while (WiFi.status() != WL_CONNECTED && retries < 20) {
-    delay(500);
-    Serial.print(".");
-    retries++;
+  // Retry a few times from a clean radio state; log the status code each
+  // time so the failure reason (no AP found, wrong password, ...) is visible.
+  for (int attempt = 1; attempt <= 3 && WiFi.status() != WL_CONNECTED; attempt++) {
+    WiFi.disconnect(true);
+    delay(200);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    int retries = 0;
+    while (WiFi.status() != WL_CONNECTED && retries < 20) {
+      delay(500);
+      Serial.print(".");
+      retries++;
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+      // 1=NO_SSID_AVAIL (AP not seen: band/channel/hidden), 4=CONNECT_FAILED
+      // (auth/password/WPA3 mismatch), 6=DISCONNECTED
+      Serial.printf("\nAttempt %d failed, WiFi.status()=%d\n", attempt, (int) WiFi.status());
+    }
   }
 
   if (WiFi.status() == WL_CONNECTED) {
@@ -135,7 +149,14 @@ void connectToWiFi() {
     Serial.print("IP Address: ");
     Serial.println(WiFi.localIP());
   } else {
-    Serial.println("\nFailed to connect to WiFi.");
+    Serial.println("\nFailed to connect to WiFi. Scanning for diagnosis:");
+    int n = WiFi.scanNetworks();
+    for (int i = 0; i < n; i++) {
+      Serial.printf("  %s  ch%d  %ddBm  enc=%d\n", WiFi.SSID(i).c_str(),
+                    WiFi.channel(i), WiFi.RSSI(i), (int) WiFi.encryptionType(i));
+    }
+    if (n <= 0) Serial.println("  no networks found");
+    WiFi.scanDelete();
   }
 }
 
