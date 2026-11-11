@@ -782,27 +782,20 @@ void drawFullDashboard() {
 // Hardware-resets the panel controller (init() pulses RST). Needed because the
 // controller can get stuck with BUSY held high (seen as endless "Busy Timeout!"
 // from GxEPD2); only a reset clears it.
-#define EPD_BUSY_PIN 14 // must match the BUSY pin in the display constructor above
 void reinitDisplay() {
   display.init(115200);
   display.setRotation(0);
 }
 
-// BUSY is active-high on this panel: it should be LOW whenever we're idle.
-// If it's HIGH before we start an update, the controller is wedged.
-void recoverDisplayIfStuck() {
-  if (digitalRead(EPD_BUSY_PIN) == HIGH) {
-    Serial.println("EPD BUSY stuck HIGH while idle - resetting display");
-    reinitDisplay();
-    Serial.printf("EPD BUSY after reset: %d\n", digitalRead(EPD_BUSY_PIN));
-  }
-}
+// A healthy partial refresh takes ~2 s; a GxEPD2 "Busy Timeout!" costs 10 s per
+// step. Anything slower than this means the controller is wedged.
+#define PARTIAL_REFRESH_MAX_MS 6000
 
 // Fast partial refresh of just the clock area - used for the once-a-minute
 // tick between full dashboard refreshes, so bumping the displayed minute
 // doesn't need WiFi or a full, more visible screen flash.
 void drawClockPartial() {
-  recoverDisplayIfStuck();
+  unsigned long startMs = millis();
   display.setPartialWindow(CLOCK_X, CLOCK_Y, CLOCK_W, CLOCK_H);
 
   display.firstPage();
@@ -814,6 +807,16 @@ void drawClockPartial() {
   display.powerOff(); // drop driving voltage between updates, don't fade the panel
 
   Serial.println("Clock partial refresh complete");
+
+  // Took far too long -> BUSY timed out, controller is stuck. Reset it and
+  // force a full redraw on the next tick (a fresh controller has no valid
+  // previous frame, so a partial update alone would leave the screen blank).
+  unsigned long elapsed = millis() - startMs;
+  if (elapsed > PARTIAL_REFRESH_MAX_MS) {
+    Serial.printf("Partial refresh took %lu ms - display stuck, resetting\n", elapsed);
+    reinitDisplay();
+    ticksSinceFullRefresh = 999;
+  }
 }
 
 // Reconnects WiFi, syncs time, pulls fresh sensor/weather data, and does a
