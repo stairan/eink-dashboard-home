@@ -1,4 +1,5 @@
 #include <WiFi.h>
+#include <esp_task_wdt.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <GxEPD2_BW.h> // For black and white displays
@@ -95,16 +96,22 @@ int totalHeatingMinutes = 0;
 int batteryPercent = 0;
 
 // --- Sleep / refresh cadence configuration ---
-// The ESP32 wakes every CLOCK_TICK_SECONDS to update just the clock via a
-// fast partial refresh (light sleep, so the display's partial-update state
-// survives between ticks). Every DAY_FULL_REFRESH_TICKS (day) or
-// NIGHT_FULL_REFRESH_TICKS (night) ticks, it instead reconnects WiFi, pulls
-// fresh sensor/weather data, and does a full-window refresh.
-#define CLOCK_TICK_SECONDS 60
-#define DAY_FULL_REFRESH_TICKS 5     // 5 * 60s = 5 minutes
-#define NIGHT_FULL_REFRESH_TICKS 10  // 10 * 60s = 10 minutes
+// The ESP32 wakes every *_TICK_SECONDS (aligned to the wall clock, so the
+// displayed minute is never stale) to update just the clock via a fast partial
+// refresh (light sleep, so the display's partial-update state survives between
+// ticks). Every *_FULL_REFRESH_MINUTES it instead reconnects WiFi, pulls fresh
+// sensor/weather data, and does a full-window refresh.
+#define DAY_TICK_SECONDS 60
+#define NIGHT_TICK_SECONDS 300        // clock updates every 5 min at night
+#define DAY_FULL_REFRESH_MINUTES 10
+#define NIGHT_FULL_REFRESH_MINUTES 30
 #define NIGHT_START_HOUR 1
 #define NIGHT_END_HOUR 5
+
+// If a wake-to-sleep cycle takes longer than this (stuck WiFi/HTTP/display),
+// the watchdog reboots the board. Generous: a full cycle with WiFi retries
+// and display timeouts can legitimately take a minute or more.
+#define WATCHDOG_TIMEOUT_SECONDS 180
 
 // Bounding box of the clock (time + date) within the header, used for
 // partial-window refreshes so the rest of the dashboard stays untouched.
@@ -113,7 +120,7 @@ const int16_t CLOCK_Y = 0;
 const int16_t CLOCK_W = 296;
 const int16_t CLOCK_H = 100;
 
-int ticksSinceFullRefresh = 999; // force a full refresh on first boot
+time_t lastFullRefreshEpoch = 0; // 0 forces a full refresh on first boot
 
 // Function to connect to Wi-Fi
 void connectToWiFi() {
@@ -815,13 +822,13 @@ void drawClockPartial() {
   if (elapsed > PARTIAL_REFRESH_MAX_MS) {
     Serial.printf("Partial refresh took %lu ms - display stuck, resetting\n", elapsed);
     reinitDisplay();
-    ticksSinceFullRefresh = 999;
+    lastFullRefreshEpoch = 0;
   }
 }
 
 // Reconnects WiFi, syncs time, pulls fresh sensor/weather data, and does a
 // full dashboard redraw. This is the expensive path - only run periodically
-// (see ticksSinceFullRefresh in loop()), not on every clock tick.
+// (see lastFullRefreshEpoch in loop()), not on every clock tick.
 void doFullRefreshCycle() {
   // Measure battery before any WiFi activity, so the reading isn't skewed
   // by voltage sag from the radio's current draw.
@@ -863,22 +870,66 @@ void setup() {
   display.setRotation(0); // Set to horizontal landscape (0 or 2 for landscape)
 }
 
-void loop() {
-  bool isNight = inNightWindow();
-  int fullRefreshInterval = isNight ? NIGHT_FULL_REFRESH_TICKS : DAY_FULL_REFRESH_TICKS;
+// Arm the task watchdog for the awake part of the cycle. It is disarmed again
+// before light sleep so long sleeps can never trip it.
+void watchdogArm() {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  esp_task_wdt_config_t cfg = {
+    .timeout_ms = WATCHDOG_TIMEOUT_SECONDS * 1000,
+    .idle_core_mask = 0,
+    .trigger_panic = true,
+  };
+  if (esp_task_wdt_reconfigure(&cfg) != ESP_OK) {
+    esp_task_wdt_init(&cfg);
+  }
+#else
+  esp_task_wdt_init(WATCHDOG_TIMEOUT_SECONDS, true);
+#endif
+  esp_task_wdt_add(NULL);
+  esp_task_wdt_reset();
+}
 
-  if (ticksSinceFullRefresh >= fullRefreshInterval) {
+void watchdogDisarm() {
+  esp_task_wdt_delete(NULL);
+}
+
+// Seconds to sleep so we wake on the next multiple of stepSeconds of wall-clock
+// time. Falls back to a plain step if the clock was never synced.
+uint32_t secondsUntilNextTick(uint32_t stepSeconds) {
+  time_t now = time(nullptr);
+  if (now < 1700000000) { // before Nov 2023 = NTP never synced
+    return stepSeconds;
+  }
+  uint32_t wait = stepSeconds - (uint32_t)(now % stepSeconds);
+  return wait < 5 ? wait + stepSeconds : wait; // avoid a near-zero sleep
+}
+
+void loop() {
+  watchdogArm();
+
+  bool isNight = inNightWindow();
+  uint32_t tickSeconds = isNight ? NIGHT_TICK_SECONDS : DAY_TICK_SECONDS;
+  uint32_t fullRefreshSeconds = (isNight ? NIGHT_FULL_REFRESH_MINUTES : DAY_FULL_REFRESH_MINUTES) * 60;
+
+  // 30 s slack so a tick that lands just short of the interval still counts.
+  time_t nowEpoch = time(nullptr);
+  bool fullDue = (lastFullRefreshEpoch == 0) ||
+                 ((uint32_t)(nowEpoch - lastFullRefreshEpoch) + 30 >= fullRefreshSeconds);
+  if (fullDue) {
     Serial.println("--- Full refresh cycle ---");
     doFullRefreshCycle();
-    ticksSinceFullRefresh = 0;
+    // Re-read: NTP sync during the cycle may have moved the clock.
+    lastFullRefreshEpoch = time(nullptr);
+    if (lastFullRefreshEpoch == 0) lastFullRefreshEpoch = 1;
   } else {
     Serial.println("--- Clock tick ---");
     drawClockPartial();
-    ticksSinceFullRefresh++;
   }
 
-  Serial.printf("Light sleep for %d seconds...\n", CLOCK_TICK_SECONDS);
+  uint32_t sleepSeconds = secondsUntilNextTick(tickSeconds);
+  Serial.printf("Light sleep for %u seconds...\n", (unsigned)sleepSeconds);
   Serial.flush();
-  esp_sleep_enable_timer_wakeup((uint64_t)CLOCK_TICK_SECONDS * 1000000ULL);
+  watchdogDisarm();
+  esp_sleep_enable_timer_wakeup((uint64_t)sleepSeconds * 1000000ULL);
   esp_light_sleep_start();
 }

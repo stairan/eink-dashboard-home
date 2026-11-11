@@ -34,13 +34,17 @@ caught), enter flash mode manually:
 
 ## How it works
 
-- The ESP32 wakes every 60 s (light sleep in between) and does a fast partial
+- The ESP32 wakes on the wall-clock minute (every 60 s by day, every 5 min at
+  night, 01:00-05:00) with light sleep in between, and does a fast partial
   refresh of the clock only.
-- Every 5 minutes by day (10 minutes at night, 01:00-05:00) it does a full
-  refresh: reads the battery, connects to WiFi, syncs NTP time, fetches the
-  sensor data, resets the e-ink controller and redraws the whole screen.
-- Timing is configured by the `CLOCK_TICK_SECONDS`, `DAY_FULL_REFRESH_TICKS`,
-  `NIGHT_FULL_REFRESH_TICKS` and `NIGHT_*_HOUR` defines.
+- Every 10 minutes by day (30 minutes at night) it does a full refresh: reads
+  the battery, connects to WiFi, syncs NTP time, fetches the sensor data,
+  resets the e-ink controller and redraws the whole screen.
+- A task watchdog (180 s) is armed while the board is awake and disarmed
+  before sleep. If WiFi, HTTP or the display hangs, the board reboots itself.
+- Timing is configured by the `DAY_TICK_SECONDS`, `NIGHT_TICK_SECONDS`,
+  `DAY_FULL_REFRESH_MINUTES`, `NIGHT_FULL_REFRESH_MINUTES`, `NIGHT_*_HOUR` and
+  `WATCHDOG_TIMEOUT_SECONDS` defines.
 
 ## Troubleshooting
 
