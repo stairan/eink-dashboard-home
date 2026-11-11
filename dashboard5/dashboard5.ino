@@ -779,10 +779,30 @@ void drawFullDashboard() {
   Serial.println("Full dashboard refresh complete");
 }
 
+// Hardware-resets the panel controller (init() pulses RST). Needed because the
+// controller can get stuck with BUSY held high (seen as endless "Busy Timeout!"
+// from GxEPD2); only a reset clears it.
+#define EPD_BUSY_PIN 14 // must match the BUSY pin in the display constructor above
+void reinitDisplay() {
+  display.init(115200);
+  display.setRotation(0);
+}
+
+// BUSY is active-high on this panel: it should be LOW whenever we're idle.
+// If it's HIGH before we start an update, the controller is wedged.
+void recoverDisplayIfStuck() {
+  if (digitalRead(EPD_BUSY_PIN) == HIGH) {
+    Serial.println("EPD BUSY stuck HIGH while idle - resetting display");
+    reinitDisplay();
+    Serial.printf("EPD BUSY after reset: %d\n", digitalRead(EPD_BUSY_PIN));
+  }
+}
+
 // Fast partial refresh of just the clock area - used for the once-a-minute
 // tick between full dashboard refreshes, so bumping the displayed minute
 // doesn't need WiFi or a full, more visible screen flash.
 void drawClockPartial() {
+  recoverDisplayIfStuck();
   display.setPartialWindow(CLOCK_X, CLOCK_Y, CLOCK_W, CLOCK_H);
 
   display.firstPage();
@@ -814,6 +834,9 @@ void doFullRefreshCycle() {
 
   fetchAllSensorStates();
 
+  // Always hardware-reset the panel before a full redraw so a wedged
+  // controller can't survive past one cycle.
+  reinitDisplay();
   drawFullDashboard();
 
   // Done with WiFi until the next full-refresh cycle - no need to keep the
@@ -825,6 +848,8 @@ void doFullRefreshCycle() {
 void setup() {
   Serial.begin(115200);
   Serial.println("\nESP32 E-Ink Home Assistant Sensor Display");
+  // 1=power-on, 3=software, 6=task WDT, 15=brownout (see esp_reset_reason_t)
+  Serial.printf("Reset reason: %d\n", (int)esp_reset_reason());
 
   analogReadResolution(12);
 
